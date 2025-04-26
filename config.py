@@ -1,0 +1,1 @@
+SESSDATA = # 从网页Cookie获得SESSDATA
