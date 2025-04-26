@@ -14,17 +14,18 @@ __author__ = 'Henry'
 
 import requests, time, hashlib, urllib.request, re, json
 import imageio
-imageio.plugins.ffmpeg.download()
 from moviepy.editor import *
 import os, sys, threading
 
-
+from config import SESSDATA  # 导入SESSDATA
 
 from tkinter import *
 from tkinter import ttk
 from tkinter import StringVar
 root=Tk()
 start_time = time.time()
+last_update_time = time.time()
+smooth_percent = 0
 
 # 将输出重定向到表格
 def print(theText):
@@ -33,23 +34,71 @@ def print(theText):
 
 # 访问API地址
 def get_play_list(start_url, cid, quality):
-    entropy = 'rbMCKn@KuamXWlPMoJGsKcbiJKUfkPF_8dABscJntvqhRSETg'
-    appkey, sec = ''.join([chr(ord(i) + 2) for i in entropy[::-1]]).split(':')
-    params = 'appkey=%s&cid=%s&otype=json&qn=%s&quality=%s&type=' % (appkey, cid, quality, quality)
-    chksum = hashlib.md5(bytes(params + sec, 'utf8')).hexdigest()
-    url_api = 'https://interface.bilibili.com/v2/playurl?%s&sign=%s' % (params, chksum)
-    headers = {
-        'Referer': start_url,  # 注意加上referer
-        'User-Agent': 'Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/55.0.2883.87 Safari/537.36'
-    }
-    # print(url_api)
-    html = requests.get(url_api, headers=headers).json()
-    # print(json.dumps(html))
-    video_list = []
-    for i in html['durl']:
-        video_list.append(i['url'])
-    # print(video_list)
-    return video_list
+    print(f'开始获取视频播放列表，cid: {cid}, quality: {quality}')
+    try:
+        # 从URL中提取bvid
+        bvid = re.search(r'BV[a-zA-Z0-9]{10}', start_url).group(0)
+        # 使用新的API
+        url_api = f'https://api.bilibili.com/x/player/playurl?cid={cid}&bvid={bvid}&qn={quality}&type=&platform=html5&high_quality=1&fnver=0&fnval=4048&fourk=1'
+        print(f'请求URL: {url_api}')
+        
+        headers = {
+            'Referer': 'https://www.bilibili.com',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Accept': '*/*',
+            'Origin': 'https://www.bilibili.com'
+        }
+        if SESSDATA:
+            headers['Cookie'] = f'SESSDATA={SESSDATA}'
+            
+        # print(f'请求头: {headers}')
+        
+        response = requests.get(url_api, headers=headers)
+        print(f'响应状态码: {response.status_code}')
+        # print(f'响应头: {response.headers}')
+        # print(f'响应内容: {response.text}')
+        
+        if response.status_code != 200:
+            print(f'错误：播放列表API请求失败，状态码：{response.status_code}')
+            return []
+            
+        try:
+            html = response.json()
+            # print(f'解析后的JSON: {html}')
+        except json.JSONDecodeError as e:
+            print(f'错误：响应内容不是有效的JSON格式: {str(e)}')
+            return []
+        
+        if html.get('code') != 0:
+            print(f'错误：播放列表API返回错误码 {html.get("code")}，消息：{html.get("message")}')
+            return []
+            
+        video_list = []
+        data = html.get('data', {})
+        
+        # 检查不同的视频URL来源
+        if 'durl' in data:
+            for item in data['durl']:
+                if 'url' in item:
+                    video_list.append(item['url'])
+        elif 'dash' in data:
+            # 处理 DASH 格式的视频
+            dash = data['dash']
+            if 'video' in dash and dash['video']:
+                # 获取最高质量的视频URL
+                video_list.append(dash['video'][0]['baseUrl'])
+            
+        if not video_list:
+            print('错误：未在响应中找到有效的视频URL')
+            print('响应数据结构:', json.dumps(data, indent=2))
+            return []
+            
+        print(f'找到 {len(video_list)} 个视频片段')
+        return video_list
+    except Exception as e:
+        print(f'获取播放列表时发生错误: {str(e)}')
+        print('错误详细信息:', traceback.format_exc())
+        return []
 
 
 # 下载视频
@@ -63,17 +112,25 @@ def callbackfunc(blocknum, blocksize, totalsize):
 
 
 def Schedule_cmd(blocknum, blocksize, totalsize):
-    speed = (blocknum * blocksize) / (time.time() - start_time)
-    # speed_str = " Speed: %.2f" % speed
-    speed_str = " Speed: %s" % format_size(speed)
-    recv_size = blocknum * blocksize
+    global last_update_time, smooth_percent
 
-    # 设置下载进度条
-    pervent = recv_size / totalsize
-    percent_str = "%.2f%%" % (pervent * 100)
-    download.coords(fill_line1,(0,0,pervent*465,23))
+    current_time = time.time()
+    recv_size = blocknum * blocksize
+    elapsed = current_time - last_update_time
+    
+    # 添加最小更新间隔(0.2秒)
+    if elapsed < 0.2:
+        return
+        
+    # 平滑处理百分比
+    raw_percent = recv_size / totalsize
+    smooth_percent = 0.7 * smooth_percent + 0.3 * raw_percent
+    
+    # 更新显示
+    download.coords(fill_line1, (0, 0, smooth_percent*465, 23))
+    pct.set("%.2f%%" % (smooth_percent * 100))
+    last_update_time = current_time
     root.update()
-    pct.set(percent_str)
 
 
 
@@ -148,7 +205,17 @@ def down_video(video_list, title, start_url, page):
 def combine_video(title_list):
     video_path = os.path.join(sys.path[0], 'bilibili_video')  # 下载目录
     for title in title_list:
-        current_video_path = os.path.join(video_path ,title)
+        current_video_path = os.path.join(video_path, title)
+        # 检查目录是否存在
+        if not os.path.exists(current_video_path):
+            print(f'警告：目录 {current_video_path} 不存在，跳过合并')
+            continue
+            
+        # 检查目录是否为空
+        if not os.listdir(current_video_path):
+            print(f'警告：目录 {current_video_path} 为空，跳过合并')
+            continue
+            
         if len(os.listdir(current_video_path)) >= 2:
             # 视频大于一段才要合并
             print('[下载完成,正在合并视频...]:' + title)
@@ -188,8 +255,19 @@ def do_prepare(inputStart,inputQuality):
         # 获取cid的api, 传入aid即可
         start_url = 'https://api.bilibili.com/x/web-interface/view?aid=' + start
     else:
-        # https://www.bilibili.com/video/av46958874/?spm_id_from=333.334.b_63686965665f7265636f6d6d656e64.16
-        start_url = 'https://api.bilibili.com/x/web-interface/view?aid=' + re.search(r'/av(\d+)/*', start).group(1)
+        # 尝试匹配BV号
+        bv_match = re.search(r'BV[a-zA-Z0-9]{10}', start)
+        if bv_match:
+            bv_id = bv_match.group(0)
+            start_url = f'https://api.bilibili.com/x/web-interface/view?bvid={bv_id}'
+        else:
+            # 尝试匹配av号
+            av_match = re.search(r'av(\d+)', start)
+            if av_match:
+                start_url = 'https://api.bilibili.com/x/web-interface/view?aid=' + av_match.group(1)
+            else:
+                print('错误：无法识别的视频链接格式！请确保输入的是有效的B站视频链接或av号')
+                return
 
     # 视频质量
     # <accept_format><![CDATA[flv,flv720,flv480,flv360]]></accept_format>
@@ -200,17 +278,55 @@ def do_prepare(inputStart,inputQuality):
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/55.0.2883.87 Safari/537.36'
     }
-    html = requests.get(start_url, headers=headers).json()
-    data = html['data']
-    cid_list = []
-    if '?p=' in start:
-        # 单独下载分P视频中的一集
-        p = re.search(r'\?p=(\d+)',start).group(1)
-        cid_list.append(data['pages'][int(p) - 1])
-    else:
-        # 如果p不存在就是全集下载
-        cid_list = data['pages']
+    print(f'开始请求API: {start_url}')
+    try:
+        response = requests.get(start_url, headers=headers, timeout=10)
+        print(f'API响应状态码: {response.status_code}')
+        if response.status_code != 200:
+            print(f'错误：API请求失败，状态码：{response.status_code}')
+            return
+        
+        print('API响应头:')
+        for key, value in response.headers.items():
+            print(f'{key}: {value}')
+        
+        response_text = response.text.strip()
+        if not response_text:
+            print('错误：API返回空响应')
+            return
+            
+        print('API响应内容:')
+        print(response_text)  # 打印完整的响应内容
+        
+        try:
+            print('开始解析JSON...')
+            html = response.json()
+            print('JSON解析成功')
+        except json.JSONDecodeError as e:
+            print(f'JSON解析错误: {str(e)}')
+            print('响应内容的前100个字符:')
+            print(response_text[:100])
+            return
+        except Exception as e:
+            print(f'解析响应时发生未知错误: {str(e)}')
+            return
+            
+        try:
+            print('开始处理数据...')
+            data = html['data']
+            cid_list = data['pages']  # 直接获取所有分集
+            print(f'找到 {len(cid_list)} 个视频分P')
+        except KeyError as e:
+            print(f'数据格式错误: 缺少必要的字段 {str(e)}')
+            return
+    except requests.exceptions.RequestException as e:
+        print(f'网络请求错误: {str(e)}')
+        return
+    except Exception as e:
+        print(f'发生未知错误: {str(e)}')
+        return
     # print(cid_list)
+    print(f'视频标题: {data["title"]}')
     # 创建线程池
     threadpool = []
     title_list = []
